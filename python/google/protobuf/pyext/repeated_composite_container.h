@@ -37,11 +37,10 @@
 #include <Python.h>
 
 #include <memory>
-#ifndef _SHARED_PTR_H
-#include <google/protobuf/stubs/shared_ptr.h>
-#endif
 #include <string>
 #include <vector>
+
+#include <google/protobuf/pyext/message.h>
 
 namespace google {
 namespace protobuf {
@@ -49,11 +48,9 @@ namespace protobuf {
 class FieldDescriptor;
 class Message;
 
-using internal::shared_ptr;
-
 namespace python {
 
-struct CMessage;
+struct CMessageClass;
 
 // A RepeatedCompositeContainer can be in one of two states: attached
 // or released.
@@ -72,7 +69,7 @@ typedef struct RepeatedCompositeContainer {
   // proto tree.  Every Python RepeatedCompositeContainer holds a
   // reference to it in order to keep it alive as long as there's a
   // Python object that references any part of the tree.
-  shared_ptr<Message> owner;
+  CMessage::OwnerRef owner;
 
   // Weak reference to parent object. May be NULL. Used to make sure
   // the parent is writable before modifying the
@@ -90,8 +87,8 @@ typedef struct RepeatedCompositeContainer {
   // calling Clear() or ClearField() on the parent.
   Message* message;
 
-  // A callable that is used to create new child messages.
-  PyObject* subclass_init;
+  // The type used to create new child messages.
+  CMessageClass* child_message_class;
 
   // A list of child messages.
   PyObject* child_messages;
@@ -106,10 +103,7 @@ namespace repeated_composite_container {
 PyObject *NewContainer(
     CMessage* parent,
     const FieldDescriptor* parent_field_descriptor,
-    PyObject *concrete_class);
-
-// Returns the number of items in this repeated composite container.
-static Py_ssize_t Length(RepeatedCompositeContainer* self);
+    CMessageClass *child_message_class);
 
 // Appends a new CMessage to the container and returns it.  The
 // CMessage is initialized using the content of kwargs.
@@ -146,11 +140,6 @@ int AssignSubscript(RepeatedCompositeContainer* self,
                     PyObject* slice,
                     PyObject* value);
 
-// Releases the messages in the container to the given message.
-//
-// Returns 0 on success, -1 on failure.
-int ReleaseToMessage(RepeatedCompositeContainer* self, Message* new_message);
-
 // Releases the messages in the container to a new message.
 //
 // Returns 0 on success, -1 on failure.
@@ -158,7 +147,7 @@ int Release(RepeatedCompositeContainer* self);
 
 // Returns 0 on success, -1 on failure.
 int SetOwner(RepeatedCompositeContainer* self,
-             const shared_ptr<Message>& new_owner);
+             const CMessage::OwnerRef& new_owner);
 
 // Removes the last element of the repeated message field 'field' on
 // the Message 'parent', and transfers the ownership of the released

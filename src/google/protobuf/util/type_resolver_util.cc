@@ -34,6 +34,7 @@
 #include <google/protobuf/wrappers.pb.h>
 #include <google/protobuf/descriptor.pb.h>
 #include <google/protobuf/descriptor.h>
+#include <google/protobuf/util/internal/utility.h>
 #include <google/protobuf/util/type_resolver.h>
 #include <google/protobuf/stubs/strutil.h>
 #include <google/protobuf/stubs/status.h>
@@ -53,98 +54,37 @@ using util::Status;
 using util::error::INVALID_ARGUMENT;
 using util::error::NOT_FOUND;
 
-bool SplitTypeUrl(const string& type_url,
-                  string* url_prefix,
-                  string* message_name) {
-  size_t pos = type_url.find_last_of("/");
-  if (pos == string::npos) {
-    return false;
-  }
-  *url_prefix = type_url.substr(0, pos);
-  *message_name = type_url.substr(pos + 1);
-  return true;
-}
-
-// This code is originally defined in
-// //google/protobuf/util/converter/utility.h. Copied here due to component
-// dependency.
-// TODO(xiaofeng): Remove this when converter code is in components.
-string ToCamelCase(const StringPiece input) {
-  bool capitalize_next = false;
-  bool was_cap = true;
-  bool is_cap = false;
-  bool first_word = true;
-  string result;
-  result.reserve(input.size());
-
-  for (size_t i = 0; i < input.size(); ++i, was_cap = is_cap) {
-    is_cap = ascii_isupper(input[i]);
-    if (input[i] == '_') {
-      capitalize_next = true;
-      if (!result.empty()) first_word = false;
-      continue;
-    } else if (first_word) {
-      // Consider when the current character B is capitalized,
-      // first word ends when:
-      // 1) following a lowercase:   "...aB..."
-      // 2) followed by a lowercase: "...ABc..."
-      if (!result.empty() && is_cap &&
-          (!was_cap || (i + 1 < input.size() && ascii_islower(input[i + 1])))) {
-        first_word = false;
-      } else {
-        result.push_back(ascii_tolower(input[i]));
-        continue;
-      }
-    } else if (capitalize_next) {
-      capitalize_next = false;
-      if (ascii_islower(input[i])) {
-        result.push_back(ascii_toupper(input[i]));
-        continue;
-      }
-    }
-    result.push_back(input[i]);
-  }
-  return result;
-}
-
 class DescriptorPoolTypeResolver : public TypeResolver {
  public:
   DescriptorPoolTypeResolver(const string& url_prefix,
                              const DescriptorPool* pool)
-      : url_prefix_(url_prefix), pool_(pool) {
-  }
+      : url_prefix_(url_prefix), pool_(pool) {}
 
-  Status ResolveMessageType(const string& type_url, Type* type) {
-    string url_prefix, message_name;
-    if (!SplitTypeUrl(type_url, &url_prefix, &message_name) ||
-        url_prefix != url_prefix_) {
-      return Status(INVALID_ARGUMENT, "Failed to parse type url: " + type_url);
+  Status ResolveMessageType(const string& type_url, Type* type) override {
+    string type_name;
+    Status status = ParseTypeUrl(type_url, &type_name);
+    if (!status.ok()) {
+      return status;
     }
-    if (url_prefix != url_prefix_) {
-      return Status(INVALID_ARGUMENT,
-                    "Cannot resolve types from URL: " + url_prefix);
-    }
-    const Descriptor* descriptor = pool_->FindMessageTypeByName(message_name);
+
+    const Descriptor* descriptor = pool_->FindMessageTypeByName(type_name);
     if (descriptor == NULL) {
-      return Status(NOT_FOUND, "Cannot found the type: " + message_name);
+      return Status(NOT_FOUND, "Invalid type URL, unknown type: " + type_name);
     }
     ConvertDescriptor(descriptor, type);
     return Status();
   }
 
-  Status ResolveEnumType(const string& type_url, Enum* enum_type) {
-    string url_prefix, type_name;
-    if (!SplitTypeUrl(type_url, &url_prefix, &type_name) ||
-        url_prefix != url_prefix_) {
-      return Status(INVALID_ARGUMENT, "Failed to parse type url: " + type_url);
+  Status ResolveEnumType(const string& type_url, Enum* enum_type) override {
+    string type_name;
+    Status status = ParseTypeUrl(type_url, &type_name);
+    if (!status.ok()) {
+      return status;
     }
-    if (url_prefix != url_prefix_) {
-      return Status(INVALID_ARGUMENT,
-                    "Cannot resolve types from URL: " + url_prefix);
-    }
+
     const EnumDescriptor* descriptor = pool_->FindEnumTypeByName(type_name);
     if (descriptor == NULL) {
-      return Status(NOT_FOUND, "Cannot found the type: " + type_name);
+      return Status(NOT_FOUND, "Invalid type URL, unknown type: " + type_name);
     }
     ConvertEnumDescriptor(descriptor, enum_type);
     return Status();
@@ -155,11 +95,6 @@ class DescriptorPoolTypeResolver : public TypeResolver {
     type->Clear();
     type->set_name(descriptor->full_name());
     for (int i = 0; i < descriptor->field_count(); ++i) {
-      const FieldDescriptor* field = descriptor->field(i);
-      if (field->type() == FieldDescriptor::TYPE_GROUP) {
-        // Group fields cannot be represented with Type. We discard them.
-        continue;
-      }
       ConvertFieldDescriptor(descriptor->field(i), type->add_fields());
     }
     for (int i = 0; i < descriptor->oneof_decl_count(); ++i) {
@@ -197,8 +132,12 @@ class DescriptorPoolTypeResolver : public TypeResolver {
     }
     field->set_number(descriptor->number());
     field->set_name(descriptor->name());
-    field->set_json_name(ToCamelCase(descriptor->name()));
-    if (descriptor->type() == FieldDescriptor::TYPE_MESSAGE) {
+    field->set_json_name(descriptor->json_name());
+    if (descriptor->has_default_value()) {
+      field->set_default_value(DefaultValueAsString(descriptor));
+    }
+    if (descriptor->type() == FieldDescriptor::TYPE_MESSAGE ||
+        descriptor->type() == FieldDescriptor::TYPE_GROUP) {
       field->set_type_url(GetTypeUrl(descriptor->message_type()));
     } else if (descriptor->type() == FieldDescriptor::TYPE_ENUM) {
       field->set_type_url(GetTypeUrl(descriptor->enum_type()));
@@ -221,8 +160,7 @@ class DescriptorPoolTypeResolver : public TypeResolver {
         descriptor->file()->name());
     for (int i = 0; i < descriptor->value_count(); ++i) {
       const EnumValueDescriptor* value_descriptor = descriptor->value(i);
-      EnumValue* value =
-          enum_type->mutable_enumvalue()->Add();
+      EnumValue* value = enum_type->mutable_enumvalue()->Add();
       value->set_name(value_descriptor->name());
       value->set_number(value_descriptor->number());
 
@@ -239,14 +177,64 @@ class DescriptorPoolTypeResolver : public TypeResolver {
     return url_prefix_ + "/" + descriptor->full_name();
   }
 
+  Status ParseTypeUrl(const string& type_url, string* type_name) {
+    if (type_url.substr(0, url_prefix_.size() + 1) != url_prefix_ + "/") {
+      return Status(INVALID_ARGUMENT,
+                    StrCat("Invalid type URL, type URLs must be of the form '",
+                           url_prefix_, "/<typename>', got: ", type_url));
+    }
+    *type_name = type_url.substr(url_prefix_.size() + 1);
+    return Status();
+  }
+
+  string DefaultValueAsString(const FieldDescriptor* descriptor) {
+    switch (descriptor->cpp_type()) {
+      case FieldDescriptor::CPPTYPE_INT32:
+        return SimpleItoa(descriptor->default_value_int32());
+        break;
+      case FieldDescriptor::CPPTYPE_INT64:
+        return SimpleItoa(descriptor->default_value_int64());
+        break;
+      case FieldDescriptor::CPPTYPE_UINT32:
+        return SimpleItoa(descriptor->default_value_uint32());
+        break;
+      case FieldDescriptor::CPPTYPE_UINT64:
+        return SimpleItoa(descriptor->default_value_uint64());
+        break;
+      case FieldDescriptor::CPPTYPE_FLOAT:
+        return SimpleFtoa(descriptor->default_value_float());
+        break;
+      case FieldDescriptor::CPPTYPE_DOUBLE:
+        return SimpleDtoa(descriptor->default_value_double());
+        break;
+      case FieldDescriptor::CPPTYPE_BOOL:
+        return descriptor->default_value_bool() ? "true" : "false";
+        break;
+      case FieldDescriptor::CPPTYPE_STRING:
+        if (descriptor->type() == FieldDescriptor::TYPE_BYTES) {
+          return CEscape(descriptor->default_value_string());
+        } else {
+          return descriptor->default_value_string();
+        }
+        break;
+      case FieldDescriptor::CPPTYPE_ENUM:
+        return descriptor->default_value_enum()->name();
+        break;
+      case FieldDescriptor::CPPTYPE_MESSAGE:
+        GOOGLE_LOG(DFATAL) << "Messages can't have default values!";
+        break;
+    }
+    return "";
+  }
+
   string url_prefix_;
   const DescriptorPool* pool_;
 };
 
 }  // namespace
 
-TypeResolver* NewTypeResolverForDescriptorPool(
-    const string& url_prefix, const DescriptorPool* pool) {
+TypeResolver* NewTypeResolverForDescriptorPool(const string& url_prefix,
+                                               const DescriptorPool* pool) {
   return new DescriptorPoolTypeResolver(url_prefix, pool);
 }
 
